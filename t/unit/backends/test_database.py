@@ -861,6 +861,55 @@ class test_DatabaseBackend:
 
         assert TaskResult.objects.get(task_id=cid).status == states.FAILURE
 
+    def test_on_chord_part_return_nested_group_uses_chord_size(self):
+        """Test if nested header group expansions can use chord_size from options."""
+        gid = uuid()
+        tid1 = uuid()
+        tid2 = uuid()
+        tid3 = uuid()
+        nested_group = GroupResult(
+            id=uuid(),
+            results=[AsyncResult(tid2), AsyncResult(tid3)],
+        )
+        group = GroupResult(
+            id=gid,
+            results=[AsyncResult(tid1), nested_group],
+        )
+        body = self.add.s()
+        body = body.set(chord_size=3)
+        self.b.apply_chord(group, body)
+
+        chord_counter = ChordCounter.objects.get(group_id=gid)
+        assert chord_counter.count == 3
+
+        request = mock.MagicMock()
+        request.id = tid1
+        request.group = gid
+        request.task = "my_task"
+        request.args = ["a", 1, "password"]
+        request.kwargs = {"c": 3, "d": "e", "password": "password"}
+        request.argsrepr = "argsrepr"
+        request.kwargsrepr = "kwargsrepr"
+        request.hostname = "celery@ip-0-0-0-0"
+        request.periodic_task_name = "my_periodic_task"
+        request.ignore_result = False
+        result = {"foo": "baz"}
+
+        self.b.mark_as_done(tid1, result, request=request)
+        request.id = tid2
+        self.b.mark_as_done(tid2, result, request=request)
+        assert ChordCounter.objects.get(group_id=gid).count == 1
+        request.chord.delay.assert_not_called()
+
+        request.id = tid3
+        with mock.patch("django_celery_results.backends.database.logger.warning") as warning:
+            self.b.mark_as_done(tid3, result, request=request)
+
+        warning.assert_not_called()
+        request.chord.delay.assert_called_once()
+        with pytest.raises(ChordCounter.DoesNotExist):
+            ChordCounter.objects.get(group_id=gid)
+
     def test_on_chord_part_return_failure(self):
         """Test if a failure in one of the chord header tasks is properly
         handled and the callback was not triggered

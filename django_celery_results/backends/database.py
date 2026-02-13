@@ -240,7 +240,10 @@ class DatabaseBackend(BaseDictBackend):
             # celery <5.1 will pass a GroupResult object
             header_result = header_result_args
         results = [r.as_tuple() for r in header_result]
-        chord_size = body.get("chord_size", None) or len(results)
+        chord_size = body.get("chord_size", None)
+        if not chord_size:
+            chord_size = body.get("options", {}).get("chord_size")
+        chord_size = chord_size or len(results)
         data = json.dumps(results)
         ChordCounter.objects.create(
             group_id=header_result.id, sub_tasks=data, count=chord_size
