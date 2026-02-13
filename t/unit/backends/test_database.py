@@ -930,6 +930,140 @@ class test_DatabaseBackend:
         with pytest.raises(ChordCounter.DoesNotExist):
             ChordCounter.objects.get(group_id=gid)
 
+    def test_on_chord_part_return_nested_group_uses_set_chord_size(self):
+        """Test nested chord size updates from set_chord_size and callback
+        payload ordering with out-of-order completion."""
+        gid = uuid()
+        tid1 = uuid()
+        tid2 = uuid()
+        tid3 = uuid()
+        nested_group = GroupResult(
+            id=uuid(),
+            results=[AsyncResult(tid2), AsyncResult(tid3)],
+        )
+        group = GroupResult(
+            id=gid,
+            results=[AsyncResult(tid1), nested_group],
+        )
+        self.b.apply_chord(group, self.add.s())
+        self.b.set_chord_size(gid, 3)
+
+        chord_counter = ChordCounter.objects.get(group_id=gid)
+        assert chord_counter.count == 3
+
+        expected = {
+            tid1: "result-1",
+            tid2: "result-2",
+            tid3: "result-3",
+        }
+        ordered_result = [expected[tid1], [expected[tid2], expected[tid3]]]
+
+        request = mock.MagicMock()
+        request.id = tid1
+        request.group = gid
+        request.task = "my_task"
+        request.args = ["a", 1, "password"]
+        request.kwargs = {"c": 3, "d": "e", "password": "password"}
+        request.argsrepr = "argsrepr"
+        request.kwargsrepr = "kwargsrepr"
+        request.hostname = "celery@ip-0-0-0-0"
+        request.periodic_task_name = "my_periodic_task"
+        request.ignore_result = False
+
+        request.id = tid2
+        self.b.mark_as_done(tid2, expected[tid2], request=request)
+        request.id = tid1
+        self.b.mark_as_done(tid1, expected[tid1], request=request)
+
+        for tid in (tid1, tid2):
+            assert self.b.get_task_meta(tid)["result"] == expected[tid]
+            assert self.b.get_task_meta(tid)["status"] == states.SUCCESS
+
+        assert ChordCounter.objects.get(group_id=gid).count == 1
+        request.chord.delay.assert_not_called()
+
+        request.id = tid3
+        with mock.patch("django_celery_results.backends.database.logger.warning") as warning:
+            self.b.mark_as_done(tid3, expected[tid3], request=request)
+
+        (callback_payload,), _ = request.chord.delay.call_args
+        assert (
+            callback_payload == ordered_result
+            or callback_payload == tuple(ordered_result)
+        )
+        assert self.b.get_task_meta(tid3)["result"] == expected[tid3]
+        assert self.b.get_task_meta(tid3)["status"] == states.SUCCESS
+
+        warning.assert_not_called()
+        request.chord.delay.assert_called_once()
+        with pytest.raises(ChordCounter.DoesNotExist):
+            ChordCounter.objects.get(group_id=gid)
+
+    def test_on_chord_part_return_nested_group_delayed_size_update(self):
+        """If completion races ahead of size updates, callback should still fire
+        once when all nested results are ready."""
+        gid = uuid()
+        tid1 = uuid()
+        tid2 = uuid()
+        tid3 = uuid()
+        nested_group = GroupResult(
+            id=uuid(),
+            results=[AsyncResult(tid2), AsyncResult(tid3)],
+        )
+        group = GroupResult(
+            id=gid,
+            results=[AsyncResult(tid1), nested_group],
+        )
+        self.b.apply_chord(group, self.add.s())
+
+        chord_counter = ChordCounter.objects.get(group_id=gid)
+        assert chord_counter.count == 2
+
+        expected = {
+            tid1: "result-1",
+            tid2: "result-2",
+            tid3: "result-3",
+        }
+        ordered_result = [expected[tid1], [expected[tid2], expected[tid3]]]
+
+        request = mock.MagicMock()
+        request.id = tid1
+        request.group = gid
+        request.task = "my_task"
+        request.args = ["a", 1, "password"]
+        request.kwargs = {"c": 3, "d": "e", "password": "password"}
+        request.argsrepr = "argsrepr"
+        request.kwargsrepr = "kwargsrepr"
+        request.hostname = "celery@ip-0-0-0-0"
+        request.periodic_task_name = "my_periodic_task"
+        request.ignore_result = False
+
+        request.id = tid2
+        self.b.mark_as_done(tid2, expected[tid2], request=request)
+        request.id = tid1
+        self.b.mark_as_done(tid1, expected[tid1], request=request)
+
+        request.chord.delay.assert_not_called()
+        assert ChordCounter.objects.get(group_id=gid).count == 0
+
+        # Simulate a late chord-size update from the sender side.
+        self.b.set_chord_size(gid, 3)
+        assert ChordCounter.objects.get(group_id=gid).count == 1
+
+        request.id = tid3
+        with mock.patch("django_celery_results.backends.database.logger.warning") as warning:
+            self.b.mark_as_done(tid3, expected[tid3], request=request)
+
+        (callback_payload,), _ = request.chord.delay.call_args
+        assert (
+            callback_payload == ordered_result
+            or callback_payload == tuple(ordered_result)
+        )
+        warning.assert_not_called()
+        request.chord.delay.assert_called_once()
+        with pytest.raises(ChordCounter.DoesNotExist):
+            ChordCounter.objects.get(group_id=gid)
+
     def test_on_chord_part_return_failure(self):
         """Test if a failure in one of the chord header tasks is properly
         handled and the callback was not triggered

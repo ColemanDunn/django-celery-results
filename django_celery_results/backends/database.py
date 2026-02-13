@@ -242,12 +242,54 @@ class DatabaseBackend(BaseDictBackend):
         results = [r.as_tuple() for r in header_result]
         chord_size = body.get("chord_size", None)
         if not chord_size:
-            chord_size = body.get("options", {}).get("chord_size")
+            body_options = body.get("options", {})
+            chord_size = body_options.get("chord_size")
+            if not chord_size:
+                chord_size = body_options.get("options", {}).get("chord_size")
         chord_size = chord_size or len(results)
         data = json.dumps(results)
         ChordCounter.objects.create(
             group_id=header_result.id, sub_tasks=data, count=chord_size
         )
+
+    def _iter_header_results(self, result):
+        if isinstance(result, GroupResult):
+            for sub_result in result.results:
+                yield from self._iter_header_results(sub_result)
+            return
+        yield result
+
+    def _count_ready_header_results(self, group_result):
+        return sum(
+            int(result.ready()) for result in self._iter_header_results(group_result)
+        )
+
+    def set_chord_size(self, group_id, chord_size):
+        """Update the number of expected header results for this chord."""
+        try:
+            chord_size = int(chord_size)
+        except (TypeError, ValueError):
+            logger.warning("Invalid chord_size %r for Group %s", chord_size, group_id)
+            return
+
+        with transaction.atomic(using=router.db_for_write(ChordCounter)):
+            try:
+                chord_counter = (
+                    ChordCounter.objects.select_for_update()
+                    .get(group_id=group_id)
+                )
+            except ChordCounter.DoesNotExist:
+                # This can happen if the chord already completed before the
+                # size update is persisted; the runtime path handles that.
+                logger.debug("Skipping set_chord_size; ChordCounter not found for Group %s", group_id)
+                return
+
+            # If some header tasks already finished, keep the remaining-count
+            # semantics by subtracting currently-ready tasks from chord_size.
+            group_result = chord_counter.group_result(app=self.app)
+            completed_count = self._count_ready_header_results(group_result)
+            chord_counter.count = max(chord_size - completed_count, 0)
+            chord_counter.save(update_fields=["count"])
 
     def on_chord_part_return(self, request, state, result, **kwargs):
         """Called on finishing each part of a Chord header"""
@@ -256,10 +298,6 @@ class DatabaseBackend(BaseDictBackend):
             return
         call_callback = False
         with transaction.atomic(using=router.db_for_write(ChordCounter)):
-            # We need to know if `count` hits 0.
-            # wrap the update in a transaction
-            # with a `select_for_update` lock to prevent race conditions.
-            # SELECT FOR UPDATE is not supported on all databases
             try:
                 chord_counter = (
                     ChordCounter.objects.select_for_update()
@@ -268,23 +306,40 @@ class DatabaseBackend(BaseDictBackend):
             except ChordCounter.DoesNotExist:
                 logger.warning("Can't find ChordCounter for Group %s", gid)
                 return
-            chord_counter.count -= 1
-            if chord_counter.count != 0:
+            # `count` is an expected-remaining approximation that can lag
+            # behind the true nested cardinality in complex chains/groups.
+            # Keep it bounded to avoid premature deletion.
+            if chord_counter.count > 0:
+                chord_counter.count -= 1
                 chord_counter.save(update_fields=["count"])
-            else:
-                # Last task in the chord header has finished
-                call_callback = True
-                chord_counter.delete()
+
+        deps = chord_counter.group_result(app=self.app)
+        if not deps.ready():
+            # If results are ignored, chord dependencies cannot become ready.
+            # Cleanup once the counter reached zero to avoid orphan rows.
+            if chord_counter.count == 0 and getattr(request, "ignore_result", False):
+                with transaction.atomic(using=router.db_for_write(ChordCounter)):
+                    ChordCounter.objects.filter(group_id=gid).delete()
+            return
+
+        with transaction.atomic(using=router.db_for_write(ChordCounter)):
+            try:
+                chord_counter = (
+                    ChordCounter.objects.select_for_update()
+                    .get(group_id=gid)
+                )
+            except ChordCounter.DoesNotExist:
+                return
+            call_callback = True
+            chord_counter.delete()
 
         if call_callback:
-            deps = chord_counter.group_result(app=self.app)
-            if deps.ready():
-                callback = maybe_signature(request.chord, app=self.app)
-                trigger_callback(
-                    app=self.app,
-                    callback=callback,
-                    group_result=deps
-                )
+            callback = maybe_signature(request.chord, app=self.app)
+            trigger_callback(
+                app=self.app,
+                callback=callback,
+                group_result=deps
+            )
 
 
 def trigger_callback(app, callback, group_result):
