@@ -862,7 +862,8 @@ class test_DatabaseBackend:
         assert TaskResult.objects.get(task_id=cid).status == states.FAILURE
 
     def test_on_chord_part_return_nested_group_uses_chord_size(self):
-        """Test if nested header group expansions can use chord_size from options."""
+        """Test nested chord size and callback payload ordering with out-of-order
+        completion."""
         gid = uuid()
         tid1 = uuid()
         tid2 = uuid()
@@ -875,12 +876,18 @@ class test_DatabaseBackend:
             id=gid,
             results=[AsyncResult(tid1), nested_group],
         )
-        body = self.add.s()
-        body = body.set(chord_size=3)
+        body = self.add.s().set(options={"chord_size": 3})
         self.b.apply_chord(group, body)
 
         chord_counter = ChordCounter.objects.get(group_id=gid)
         assert chord_counter.count == 3
+
+        expected = {
+            tid1: "result-1",
+            tid2: "result-2",
+            tid3: "result-3",
+        }
+        ordered_result = [expected[tid1], [expected[tid2], expected[tid3]]]
 
         request = mock.MagicMock()
         request.id = tid1
@@ -893,17 +900,30 @@ class test_DatabaseBackend:
         request.hostname = "celery@ip-0-0-0-0"
         request.periodic_task_name = "my_periodic_task"
         request.ignore_result = False
-        result = {"foo": "baz"}
 
-        self.b.mark_as_done(tid1, result, request=request)
         request.id = tid2
-        self.b.mark_as_done(tid2, result, request=request)
+        self.b.mark_as_done(tid2, expected[tid2], request=request)
+        request.id = tid1
+        self.b.mark_as_done(tid1, expected[tid1], request=request)
+
+        for tid in (tid1, tid2):
+            assert self.b.get_task_meta(tid)["result"] == expected[tid]
+            assert self.b.get_task_meta(tid)["status"] == states.SUCCESS
+
         assert ChordCounter.objects.get(group_id=gid).count == 1
         request.chord.delay.assert_not_called()
 
         request.id = tid3
         with mock.patch("django_celery_results.backends.database.logger.warning") as warning:
-            self.b.mark_as_done(tid3, result, request=request)
+            self.b.mark_as_done(tid3, expected[tid3], request=request)
+
+        (callback_payload,), _ = request.chord.delay.call_args
+        assert (
+            callback_payload == ordered_result
+            or callback_payload == tuple(ordered_result)
+        )
+        assert self.b.get_task_meta(tid3)["result"] == expected[tid3]
+        assert self.b.get_task_meta(tid3)["status"] == states.SUCCESS
 
         warning.assert_not_called()
         request.chord.delay.assert_called_once()
